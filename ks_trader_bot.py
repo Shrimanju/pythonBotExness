@@ -1808,6 +1808,550 @@ def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instru
     return True
 
 
+
+# ---------- Hourly daily trade report (IST) ----------
+DAILY_REPORT_PATH = Path(os.getenv('DAILY_REPORT_FILE', 'KS_Trader_Desk_Daily_Report.txt'))
+
+def _report_money(value: Decimal) -> str:
+    return f'${value:,.2f}'
+
+def _report_cash_for_order(order: dict, reason: str) -> Decimal | None:
+    entry, sl, tp, volume = (order.get(k) for k in ('price', 'stop_loss_price', 'take_profit_price', 'volume'))
+    if any(v in (None, '') for v in (entry, sl, tp, volume)):
+        return None
+    try:
+        entry_d, sl_d, tp_d, volume_d = map(dec, (entry, sl, tp, volume))
+        contract_size = dec(os.getenv('CONTRACT_SIZE', '100.0'))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if volume_d <= 0:
+        return None
+    side = str(order.get('direction', '')).lower()
+    if side not in {'buy', 'sell'}:
+        return None
+    if reason == 'SL':
+        return -(abs(entry_d - sl_d) * contract_size * volume_d)
+    if reason == 'TP':
+        return abs(tp_d - entry_d) * contract_size * volume_d
+    return None
+
+def _classify_report_orders(order_items: list[dict], deal_items: list[dict], start_utc: datetime, end_utc: datetime, instrument: str) -> dict:
+    orders = _history_orders({'items': order_items})
+    deals = _history_deals({'items': deal_items})
+    open_order_ids = {str(d.get('order_id') or '') for d in deals if str(d.get('type', '')).lower() == 'open'}
+    open_positions = {str(d.get('position_id') or '') for d in deals if str(d.get('type', '')).lower() == 'open'}
+    total = active_count = inactive_count = 0
+    active_pnl = inactive_pnl = Decimal('0')
+    seen = set()
+    for order in orders:
+        if str(order.get('order_type', '')).lower() != 'limit' or str(order.get('instrument', '')).upper() != instrument.upper():
+            continue
+        created = _history_time(order.get('create_time'))
+        if not created or not (start_utc <= created <= end_utc):
+            continue
+        oid = str(order.get('order_id') or '')
+        if not oid or oid in seen:
+            continue
+        seen.add(oid)
+        if oid in open_order_ids or str(order.get('position_id') or '') in open_positions:
+            active_count += 1
+            total += 1
+            pid = str(order.get('position_id') or '')
+            for deal in deals:
+                if pid and str(deal.get('position_id') or '') == pid and str(deal.get('type', '')).lower() == 'close':
+                    profit = deal.get('profit')
+                    if isinstance(profit, dict) and profit.get('amount') not in (None, ''):
+                        active_pnl += dec(profit['amount'])
+            continue
+        state = str(order.get('state', '')).lower()
+        reason = str(order.get('reason', '')).lower()
+        if reason not in {'sl', 'tp'}:
+            if state in {'sl', 'stop_loss', 'stopped_by_sl'}: reason = 'sl'
+            elif state in {'tp', 'take_profit', 'closed_by_tp'}: reason = 'tp'
+            else: continue
+        estimated = _report_cash_for_order(order, reason.upper())
+        if estimated is None: continue
+        inactive_count += 1
+        total += 1
+        inactive_pnl += estimated
+    return {'total': total, 'active_count': active_count, 'inactive_count': inactive_count,
+            'active_pnl': active_pnl, 'inactive_pnl': inactive_pnl, 'profit_day': active_pnl}
+
+def _update_daily_report_file(report: dict, report_date) -> None:
+    DAILY_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    label = report_date.strftime('%d-%b-%Y')
+    sep = '=' * 31
+    block = '\n'.join([sep, f'Date : {label}',
+        f'Number of trades taken per day : {report["total"]}',
+        f'Overall active orders : {report["active_count"]}',
+        f'Overall inactive orders : {report["inactive_count"]}',
+        f'Profit of the day : {_report_money(report["profit_day"])}',
+        f'P/L of active orders : {_report_money(report["active_pnl"])}',
+        f'P/L of inactive orders : {_report_money(report["inactive_pnl"])}', sep])
+    old = DAILY_REPORT_PATH.read_text(encoding='utf-8') if DAILY_REPORT_PATH.exists() else ''
+    sections = re.split(r'(?m)^={10,}\s*(value: Any, digits: int = 3) -> str:
+    if value in (None, ""):
+        return "N/A"
+    try:
+        return f"{float(dec(value)):.{max(0, min(digits, 8))}f}"
+    except Exception:
+        return str(value)
+
+
+def display_trade_dashboard(store: StateStore, snapshot: dict, m1: pd.DataFrame,
+                            instrument: str, account_mode: str, contract_size: float,
+                            daily_opening_balance: float, risk_percent: float,
+                            risk_buffer_percent: float, conditions: dict,
+                            trailing_enabled: bool) -> None:
+    """Print a concise, human-readable CMD dashboard from broker-confirmed data."""
+    orders, positions = instrument_activity(snapshot, instrument)
+    digits = int(conditions.get("point_digits", 3) or 3)
+    now_ist = datetime.now(IST).strftime("%d-%b-%Y %I:%M:%S %p IST")
+    lines = ["", "=" * 68, f" KS TRADER DESK | {instrument} | {account_mode.upper()} ACCOUNT", "=" * 68,
+             f"Time: {now_ist}"]
+    if positions:
+        position = positions[0]
+        pid = str(position.get("position_id", "N/A"))
+        side = str(position.get("direction", "unknown")).upper()
+        entry_raw = position.get("open_price")
+        volume_raw = position.get("volume")
+        lock = store.get_json("trade_lock", {}) or {}
+        trail = store.get_json("adaptive_trailing_state", {}) or {}
+        sltp = _find_position_sltp_order(snapshot, instrument, pid) or {}
+        entry = float(dec(entry_raw)) if entry_raw not in (None, "") else None
+        volume = float(dec(volume_raw if volume_raw not in (None, "") else lock.get("volume"))) if (volume_raw not in (None, "") or lock.get("volume") not in (None, "")) else None
+        tp_raw = sltp.get("take_profit_price") or lock.get("tp") or trail.get("initial_tp")
+        sl_broker = sltp.get("stop_loss_price")
+        # Prefer the latest SL confirmed and persisted after Exness snapshot confirmation.
+        sl_current = trail.get("current_sl") or sl_broker
+        sl_initial = trail.get("initial_sl") or lock.get("sl")
+        # The exit side is bid for BUY and ask for SELL.
+        current = None
+        if not m1.empty:
+            last = m1.iloc[-1]
+            col = "close" if side == "BUY" else "ask_close"
+            fallback = "close"
+            raw = last.get(col, None)
+            if raw is None or pd.isna(raw):
+                raw = last.get(fallback, None)
+            if raw is not None and not pd.isna(raw):
+                current = float(raw)
+        tp = float(dec(tp_raw)) if tp_raw not in (None, "") else None
+        initial_sl = float(dec(sl_initial)) if sl_initial not in (None, "") else None
+        cur_sl = float(dec(sl_current)) if sl_current not in (None, "") else None
+        risk_distance = abs(entry - initial_sl) if entry is not None and initial_sl is not None else None
+        favourable = ((current-entry) if side == "BUY" else (entry-current)) if current is not None and entry is not None and side in {"BUY", "SELL"} else None
+        r_multiple = favourable / risk_distance if favourable is not None and risk_distance and risk_distance > 0 else None
+        tp_distance = abs(tp-entry) if tp is not None and entry is not None else None
+        tp_progress = favourable / tp_distance * 100 if favourable is not None and tp_distance and tp_distance > 0 else None
+        est_pl = favourable * contract_size * volume if favourable is not None and volume is not None else None
+        risk_cash = risk_distance * contract_size * volume if risk_distance is not None and volume is not None else None
+        trailing_pending = store.get_json("trailing_pending_operation", {}) or {}
+        stage = trail.get("last_stage") or (" / ".join(trail.get("stages", [])) if trail.get("stages") else "Monitoring structure")
+        lines += ["", f"TRADE IN PROGRESS : {side} POSITION", f"Position ID  : {pid}",
+                  f"Lot / Volume : {volume:.2f}" if volume is not None else "Lot / Volume : N/A",
+                  f"Entry Price  : {_display_price(entry, digits)}",
+                  f"Market Price  : {_display_price(current, digits)}  (latest completed candle)",
+                  f"Take Profit  : {_display_price(tp, digits)}",
+                  f"Current Stop  : {_display_price(cur_sl, digits)}  (confirmed by Exness)",
+                  f"Initial Stop  : {_display_price(initial_sl, digits)}" if initial_sl is not None else "Initial Stop  : Not available",
+                  f"Initial Risk : {risk_distance:.{digits}f} price units" if risk_distance is not None else "Initial Risk : N/A",
+                  f"Planned Risk  : ~${risk_cash:.2f}" if risk_cash is not None else "Planned Risk  : Not available",
+                  f"Open P/L      : ~${est_pl:.2f} gross estimate" if est_pl is not None else "Open P/L      : Not available",
+                  f"Open R       : {r_multiple:+.2f}R" if r_multiple is not None else "Open R       : N/A",
+                  f"TP Progress  : {tp_progress:.1f}%" if tp_progress is not None else "TP Progress  : N/A",
+                  f"Stop Manager  : {'ON' if trailing_enabled else 'OFF'} | Stage: {stage}"]
+        if trailing_pending:
+            lines.append(f"Stop Update   : Waiting for Exness to confirm {_display_price(trailing_pending.get('candidate_sl'), digits)}")
+        else:
+            lines.append("Stop Update   : No change pending")
+        if est_pl is not None:
+            lines.append("P/L note     : Gross estimate; excludes commission, swap and broker adjustments")
+    elif orders:
+        order = orders[0]
+        lines += ["", f"WAITING FOR ENTRY : {str(order.get('direction', '')).upper()} LIMIT ORDER",
+                  f"Order ID     : {order.get('order_id', 'N/A')}",
+                  f"Direction    : {str(order.get('direction', 'N/A')).upper()}",
+                  f"Entry Price  : {_display_price(order.get('price'), digits)}",
+                  f"Stop Loss    : {_display_price(order.get('stop_loss_price'), digits)}",
+                  f"Take Profit  : {_display_price(order.get('take_profit_price'), digits)}",
+                  f"Volume       : {order.get('volume', 'N/A')}",
+                  "Next Step     : Waiting for market price to reach the entry level",
+                  "Safety        : No second XAUUSD entry will be placed while this order is active"]
+    else:
+        lines += ["", "TRADE STATUS : NO ACTIVE XAUUSD TRADE", "Watching completed 1-minute candles for the next valid setup."]
+    total_risk_percent = min(7.0, risk_percent + risk_buffer_percent)
+    daily_budget = (
+        daily_opening_balance
+        * Decimal(str(total_risk_percent))
+        / Decimal("100")
+    )
+    lines += ["", f"Daily Opening Balance: ${daily_opening_balance:.2f}",
+              f"Risk Budget          : {risk_percent:.2f}% + {risk_buffer_percent:.2f}% buffer = {total_risk_percent:.2f}% (${daily_budget:.2f})", 
+              f"New Entries          : {'ON (DEMO LIMIT only)' if os.getenv('TRADING_ENABLED', 'false').strip().lower() in {'1','true','yes','y','on'} else 'OFF'}",
+              "=" * 68, ""]
+    print("\n".join(lines), flush=True)
+
+
+def pending_submission_blocks(store: StateStore, snapshot: dict, instrument: str) -> bool:
+    """Fail closed while an earlier POST has an unresolved outcome."""
+    record = store.get_json("submission_state", {}) or {}
+    status = str(record.get("status", "")).lower()
+    if status not in {"prepared", "uncertain", "acknowledged"}:
+        return False
+    orders, positions = instrument_activity(snapshot, instrument)
+    if orders or positions:
+        record["status"] = "reconciled_present"
+        record["reconciled_at"] = utc_iso(datetime.now(UTC))
+        store.set_json("submission_state", record)
+        logging.warning(
+            "The earlier order is now visible in your Exness account (%d pending order(s), %d open position(s)). The bot will wait and will not place another entry.",
+            len(orders), len(positions),
+        )
+        return False
+    logging.critical("The previous order's result is still unknown. The bot has paused new entries until Exness confirms what happened.")
+    return True
+
+
+def create_submission_record(store: StateStore, signal: dict) -> str:
+    """Persist intent and idempotency key before the single mutating POST."""
+    existing = store.get_json("submission_state", {}) or {}
+    if str(existing.get("status", "")).lower() in {"prepared", "uncertain", "acknowledged"}:
+        raise RuntimeError("An earlier order submission is unresolved; refusing another POST.")
+    idem = "KS1-" + uuid.uuid4().hex
+    record = {
+        "status": "prepared",
+        "idempotency_key": idem,
+        "created_at": utc_iso(datetime.now(UTC)),
+        "instrument": signal.get("instrument"),
+        "side": signal.get("side"),
+        "bar_time": signal.get("bar_time"),
+        "entry": signal.get("entry_text"),
+        "sl": signal.get("sl_text"),
+        "tp": signal.get("tp_text"),
+        "volume": signal.get("volume_text"),
+        "risk_cash": signal.get("risk_cash"),
+    }
+    store.set_json("submission_state", record)
+    store.set_json("trade_lock", {
+        "active": True,
+        "state": "submission_pending",
+        "created_at": record["created_at"],
+        "instrument": record.get("instrument"),
+        "side": record.get("side"),
+        "entry": record.get("entry"),
+        "sl": record.get("sl"),
+        "tp": record.get("tp"),
+        "volume": record.get("volume"),
+        "order_id": None,
+        "position_id": None,
+        "idempotency_key": idem,
+    })
+    return idem
+
+
+def update_submission(store: StateStore, status: str, **fields: Any) -> None:
+    record = store.get_json("submission_state", {}) or {}
+    record.update(fields)
+    record["status"] = status
+    record["updated_at"] = utc_iso(datetime.now(UTC))
+    store.set_json("submission_state", record)
+
+
+def main() -> int:
+    cfg = Config.from_env()
+    trailing_enabled = env_bool("ADAPTIVE_TRAILING_ENABLED", cfg.trading_enabled)
+    configure_logging(cfg.log_level)
+    logging.info("=" * 68)
+    logging.info("KS TRADER DESK is starting (version %s).", APP_VERSION)
+    logging.info("Account: %s | Market: %s", cfg.account_mode.upper(), cfg.instrument)
+    logging.info("Entry method: LIMIT orders only | No market-order fallback")
+    logging.info(
+        "Risk per trade: %.2f%% target + %.2f%% buffer = %.2f%% maximum | Reward ratio: %s | Stop manager: %s",
+        cfg.risk_percent, cfg.risk_buffer_percent,
+        min(7.0, cfg.risk_percent + cfg.risk_buffer_percent),
+        cfg.risk_reward, "ON" if trailing_enabled else "OFF",
+    )
+    if cfg.trading_enabled:
+        logging.info("New DEMO entries are ENABLED. The bot will only trade when a valid signal appears.")
+    else:
+        logging.info("New entries are OFF. The bot will monitor signals without placing orders.")
+    logging.info("=" * 68)
+
+    store = StateStore(cfg.db_path)
+    api = ExnessAPI(cfg)
+    api.discover_access_point()
+    conditions = api.instrument_conditions()
+    logging.info(
+        "XAUUSD trading settings loaded: price decimals=%s, minimum lot=%s, lot step=%s.",
+        conditions.get("point_digits"), conditions.get("volume_min"), conditions.get("volume_step"),
+    )
+    if conditions.get("instrument") and str(conditions["instrument"]).upper() != cfg.instrument.upper():
+        raise RuntimeError(f"API returned conditions for {conditions['instrument']}, not {cfg.instrument}.")
+
+    pending = {}
+    try:
+        pending = store.get_json("breakout_pending", {}) or {}
+    except Exception:
+        logging.error("Saved breakout setup could not be restored. A fresh setup will be used.")
+        logging.debug("Breakout restore details:", exc_info=True)
+        pending = {}
+
+    snap = api.snapshot()
+    orders, positions = instrument_activity(snap, cfg.instrument)
+    logging.info("Account check: %d pending order(s) and %d open position(s) found for %s.", len(orders), len(positions), cfg.instrument)
+    daily_opening_balance, daily_balance_date = get_daily_opening_balance(store, api, snap)
+    logging.info(
+        "Today's opening balance (%s IST): $%.2f | Risk target %.2f%% + buffer %.2f%% = maximum $%.2f (%.2f%%).",
+        daily_balance_date, float(daily_opening_balance), cfg.risk_percent,
+        cfg.risk_buffer_percent,
+        float(daily_opening_balance * dec(min(7.0, cfg.risk_percent + cfg.risk_buffer_percent)) / Decimal("100")),
+        min(7.0, cfg.risk_percent + cfg.risk_buffer_percent),
+    )
+    unresolved = pending_submission_blocks(store, snap, cfg.instrument)
+    existing_lock = store.get_json("trade_lock", {}) or {}
+    previous_submission = store.get_json("submission_state", {}) or {}
+    if str(previous_submission.get("status", "")).lower() == "rejected":
+        if not existing_lock.get("active"):
+            existing_lock.update({
+                "active": True,
+                "state": "rejected_signal_hold",
+                "http_status": previous_submission.get("http_status"),
+                "created_at": previous_submission.get("created_at") or utc_iso(datetime.now(UTC)),
+            })
+            store.set_json("trade_lock", existing_lock)
+        logging.warning("A previous entry was rejected by Exness. New entries remain paused until that rejection is reviewed.")
+    if not existing_lock.get("active") and (orders or positions):
+        # Adopt existing activity after an upgrade/restart rather than risking
+        # a second entry while a pre-existing trade is still running.
+        adopted = orders[0] if orders else None
+        adopted_position = positions[0] if positions else None
+        created = (adopted or adopted_position or {}).get("create_time") or utc_iso(datetime.now(UTC))
+        store.set_json("trade_lock", {
+            "active": True, "state": "adopted_existing_activity", "created_at": created,
+            "instrument": cfg.instrument,
+            "order_id": (adopted or {}).get("order_id"),
+            "position_id": (adopted_position or {}).get("position_id"),
+            "side": (adopted or adopted_position or {}).get("direction"),
+            "entry": str((adopted or {}).get("price", "")),
+        })
+        logging.warning("An existing XAUUSD order or position was found. The bot will manage/wait for it and will not place another entry.")
+    last_bar = store.get("last_processed_m1", "")
+    last_report_hour = ""
+    update_hourly_daily_report(api, snap, cfg.instrument)
+    last_report_hour = datetime.now(IST).strftime("%Y-%m-%d-%H")
+
+    while True:
+        try:
+            m1 = api.candles("M1", cfg.candles_count)
+            m3 = api.candles("M3", max(300, min(cfg.candles_count, 900)))
+            if len(m1) < 210 or len(m3) < 55:
+                logging.info("Waiting for enough completed market candles before checking for a signal.")
+                time.sleep(cfg.poll_seconds)
+                continue
+            bar_ts = m1.iloc[-1]["time"].isoformat()
+            if bar_ts == last_bar:
+                time.sleep(cfg.poll_seconds)
+                continue
+
+            snap = api.snapshot()
+            current_report_hour = datetime.now(IST).strftime("%Y-%m-%d-%H")
+            if current_report_hour != last_report_hour:
+                update_hourly_daily_report(api, snap, cfg.instrument)
+                last_report_hour = current_report_hour
+            active_orders, open_positions = instrument_activity(snap, cfg.instrument)
+            trade_locked = refresh_trade_lock(store, api, snap, cfg.instrument)
+            unresolved = pending_submission_blocks(store, snap, cfg.instrument)
+            # Run once per newly completed M1 candle. Pending orders are ignored;
+            # only an actually open position with its linked active SLTP order is managed.
+            if trade_locked and open_positions and trailing_enabled:
+                run_adaptive_trailing(store, api, snap, m1, conditions, cfg.instrument)
+            if trade_locked or active_orders or open_positions:
+                display_trade_dashboard(
+                    store, snap, m1, cfg.instrument, cfg.account_mode, cfg.contract_size,
+                    daily_opening_balance, cfg.risk_percent, cfg.risk_buffer_percent,
+                    conditions, trailing_enabled,
+                )
+            if trade_locked:
+                store.set("last_processed_m1", bar_ts)
+                last_bar = bar_ts
+                time.sleep(cfg.poll_seconds)
+                continue
+            if unresolved:
+                store.set("last_processed_m1", bar_ts)
+                last_bar = bar_ts
+                time.sleep(cfg.poll_seconds)
+                continue
+
+            if active_orders or open_positions:
+                logging.info(
+                    "Existing %s activity: %d active order(s), %d open position(s). "
+                    "No new Entry 1 order will be submitted.",
+                    cfg.instrument, len(active_orders), len(open_positions),
+                )
+                store.set("last_processed_m1", bar_ts)
+                last_bar = bar_ts
+                time.sleep(cfg.poll_seconds)
+                continue
+
+            daily_opening_balance, daily_balance_date = get_daily_opening_balance(store, api, snap)
+            risk_cfg = replace(cfg, account_capital=float(daily_opening_balance))
+            signal, pending = compute_signal(m1, m3, risk_cfg, pending)
+            store.set_json("breakout_pending", pending)
+            # Consume this closed bar before validation/submission so the same
+            # signal cannot be replayed on each polling iteration.
+            store.set("last_processed_m1", bar_ts)
+            last_bar = bar_ts
+
+            if signal:
+                signal = check_broker_compatibility(signal, conditions)
+                signal["instrument"] = cfg.instrument
+                logging.info("-" * 58)
+                logging.info("NEW %s SIGNAL | %s", signal["side"].upper(), cfg.instrument)
+                logging.info("Entry price : %s (confirmation candle midpoint)", signal["entry_text"])
+                logging.info("Stop Loss   : %s", signal["sl_text"])
+                logging.info("Take Profit : %s", signal["tp_text"])
+                logging.info("Lot size    : %s", signal["volume_text"])
+                logging.info("Planned risk: $%.2f (maximum allowed %.2f%%) | Reward ratio: %s", signal["risk_cash"], min(7.0, cfg.risk_percent + cfg.risk_buffer_percent), cfg.risk_reward)
+                logging.info("Signal time : %s", signal["bar_time"])
+                logging.info("-" * 58)
+                if cfg.trading_enabled:
+                    snap2 = api.snapshot()
+                    orders2, positions2 = instrument_activity(snap2, cfg.instrument)
+                    if orders2 or positions2:
+                        logging.warning("A different XAUUSD order or position appeared before submission. This signal was skipped to avoid duplicate trades.")
+                    else:
+                        idem = create_submission_record(store, signal)
+                        try:
+                            # Exactly one POST attempt. Never auto-retry after a timeout/5xx.
+                            ack = api.place_entry_limit(signal, signal["volume_text"], idem=idem)
+                        except APIHTTPError as exc:
+                            update_submission(store, "rejected", http_status=exc.status_code, error=str(exc))
+                            lock = store.get_json("trade_lock", {}) or {}
+                            lock.update({
+                                "active": True,
+                                "state": "rejected_signal_hold",
+                                "http_status": exc.status_code,
+                                "rejection_payload": exc.payload,
+                            })
+                            store.set_json("trade_lock", lock)
+                            logging.error(
+                                "ORDER REJECTED: Exness declined this entry (HTTP %s). New entries are paused until the rejection is reviewed.",
+                                exc.status_code,
+                            )
+                            logging.debug("Exness rejection details: %s", exc.payload)
+                        except UncertainPostError as exc:
+                            update_submission(store, "uncertain", error=str(exc))
+                            logging.error("ORDER STATUS UNCERTAIN: Exness did not confirm whether it received the order. The bot will not send it again automatically.")
+                            logging.debug("Order submission details: %s", exc)
+                        except Exception as exc:
+                            # Unexpected failures after POST initiation are treated as uncertain.
+                            update_submission(store, "uncertain", error=repr(exc))
+                            logging.error("ORDER STATUS UNCERTAIN: Something interrupted the order request. The bot will check Exness and will not repeat the request automatically.")
+                            logging.debug("Order POST exception details:", exc_info=True)
+                        else:
+                            operation_id = ack.get("operation_id")
+                            update_submission(
+                                store, "acknowledged", ack=ack,
+                                operation_id=str(operation_id) if operation_id else None,
+                            )
+                            logging.info("ORDER SENT: Your %s LIMIT order was sent to Exness. Waiting for confirmation.", signal["side"].upper())
+                            if operation_id:
+                                deadline = time.time() + 30
+                                while time.time() < deadline:
+                                    status_doc = api.operation_status(str(operation_id))
+                                    op_state = str(status_doc.get("status", "")).lower()
+                                    if op_state in {"rejected", "failed"}:
+                                        update_submission(store, "rejected", operation_status=status_doc)
+                                        lock = store.get_json("trade_lock", {}) or {}
+                                        lock.update({"active": False, "state": "submission_rejected"})
+                                        store.set_json("trade_lock", lock)
+                                        logging.error("ORDER REJECTED: Exness did not accept this LIMIT order. No order is considered active.")
+                                        logging.debug("Order operation response: %s", status_doc)
+                                        break
+                                    if op_state in {"cancelled", "canceled"}:
+                                        update_submission(store, "cancelled", operation_status=status_doc)
+                                        logging.warning("ENTRY REQUEST CANCELLED: Exness cancelled the order request. The bot will verify the account history before allowing another entry.")
+                                        logging.debug("Order operation response: %s", status_doc)
+                                        break
+                                    if op_state in {"confirmed", "completed", "succeeded", "success"}:
+                                        update_submission(store, "acknowledged", operation_status=status_doc)
+                                        logging.info("ORDER CONFIRMED: Exness registered your %s LIMIT order. Waiting for market price to reach %s.", signal["side"].upper(), signal["entry_text"])
+                                        break
+                                    time.sleep(2)
+                                    time.sleep(2)
+                            else:
+                                logging.warning("Exness has not provided a confirmation reference yet. The bot will check the account before sending anything else.")
+                            snap3 = api.snapshot()
+                            orders3, positions3 = instrument_activity(snap3, cfg.instrument)
+                            logging.info("Exness account check: %d pending order(s), %d open position(s).", len(orders3), len(positions3))
+                            if orders3 or positions3:
+                                update_submission(store, "reconciled_present", reconciled_at=utc_iso(datetime.now(UTC)))
+                            elif str((store.get_json("submission_state", {}) or {}).get("status", "")) != "rejected":
+                                logging.error("ORDER NOT YET VISIBLE: Exness acknowledged the request, but the account does not show it yet. New entries are paused while the bot checks again.")
+                else:
+                    logging.info("SIGNAL ONLY: no order was placed because automatic entries are turned OFF.")
+
+            time.sleep(cfg.poll_seconds)
+        except KeyboardInterrupt:
+            logging.info("KS Trader Desk stopped safely.")
+            return 0
+        except Exception as exc:
+            logging.error("TEMPORARY ISSUE: The bot could not complete this market check. It will reconnect and try again.")
+            logging.debug("Main loop error details:", exc_info=True)
+            # GET recovery is safe and retried inside request(); no order POST is repeated.
+            try:
+                api.discover_access_point()
+                snap = api.snapshot()
+                orders, positions = instrument_activity(snap, cfg.instrument)
+                logging.info("Connection restored. Exness shows %d pending order(s) and %d open position(s).", len(orders), len(positions))
+                pending_submission_blocks(store, snap, cfg.instrument)
+            except Exception:
+                logging.error("Could not reconnect to Exness yet. The bot will pause briefly and try again.")
+                logging.debug("Exness reconnection details:", exc_info=True)
+            time.sleep(max(cfg.poll_seconds, 5))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        logging.basicConfig(level=logging.ERROR)
+        logging.error("The bot could not start. Please check ks_trader_bot.log for technical details.")
+        logging.debug("Startup error details:", exc_info=True)
+        raise SystemExit(1)
+, old)
+    output = []
+    found = False
+    for section in sections:
+        if f'Date : {label}' in section:
+            if not found: output.append(block); found = True
+        elif section.strip():
+            output.append(sep + '\n' + section.strip() + '\n' + sep)
+    if not found: output.append(block)
+    DAILY_REPORT_PATH.write_text('\n'.join(output).rstrip() + '\n', encoding='utf-8')
+
+def update_hourly_daily_report(api: ExnessAPI, snapshot: dict, instrument: str) -> None:
+    now_ist = datetime.now(IST)
+    midnight_ist = datetime.combine(now_ist.date(), datetime.min.time(), tzinfo=IST)
+    start_utc, end_utc = midnight_ist.astimezone(UTC), datetime.now(UTC)
+    order_items = api.orders_history_all_since(start_utc, end_utc, instrument)
+    deal_items = api.deals_history_all_since(start_utc, end_utc)
+    report = _classify_report_orders(order_items, deal_items, start_utc, end_utc, instrument)
+    floating = Decimal('0')
+    for position in (snapshot.get('positions', []) or []):
+        if str(position.get('instrument', '')).upper() != instrument.upper() or str(position.get('state', '')).lower() not in {'open', 'opened'}:
+            continue
+        raw = position.get('profit')
+        if isinstance(raw, dict): raw = raw.get('amount')
+        if raw not in (None, ''): floating += dec(raw)
+    report['active_pnl'] += floating
+    report['profit_day'] = report['active_pnl']
+    _update_daily_report_file(report, now_ist.date())
+    logging.info('Hourly report refreshed: %s | trades %d | active %d | inactive %d | active P/L %s | inactive P/L %s',
+        DAILY_REPORT_PATH, report['total'], report['active_count'], report['inactive_count'],
+        _report_money(report['active_pnl']), _report_money(report['inactive_pnl']))
+
 def _display_price(value: Any, digits: int = 3) -> str:
     if value in (None, ""):
         return "N/A"
