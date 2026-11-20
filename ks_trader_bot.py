@@ -1827,41 +1827,157 @@ def _report_cash_for_order(order: dict, reason: str) -> Decimal | None:
     if reason == 'TP': return abs(tp_d - entry_d) * contract_size * volume_d
     return None
 
-def _classify_report_orders(order_items: list[dict], deal_items: list[dict], start_utc: datetime, end_utc: datetime, instrument: str) -> dict:
-    orders = _history_orders({'items': order_items})
-    deals = _history_deals({'items': deal_items})
-    opened = [d for d in deals if str(d.get('type', '')).lower() == 'open']
-    opened_order_ids = {str(d.get('order_id') or '') for d in opened}
-    opened_position_ids = {str(d.get('position_id') or '') for d in opened}
-    report = {'total': 0, 'active_count': 0, 'inactive_count': 0, 'active_pnl': Decimal('0'), 'inactive_pnl': Decimal('0'), 'profit_day': Decimal('0')}
-    seen = set()
-    for order in orders:
-        if str(order.get('order_type', '')).lower() != 'limit' or str(order.get('instrument', '')).upper() != instrument.upper(): continue
-        created = _history_time(order.get('create_time'))
-        if not created or not (start_utc <= created <= end_utc): continue
-        oid = str(order.get('order_id') or '')
-        if not oid or oid in seen: continue
-        seen.add(oid)
-        pid = str(order.get('position_id') or '')
-        if oid in opened_order_ids or (pid and pid in opened_position_ids):
-            report['total'] += 1
-            report['active_count'] += 1
-            if pid:
-                for deal in deals:
-                    if str(deal.get('position_id') or '') == pid and str(deal.get('type', '')).lower() == 'close':
-                        profit = deal.get('profit')
-                        if isinstance(profit, dict) and profit.get('amount') not in (None, ''):
-                            report['active_pnl'] += dec(profit['amount'])
+def _report_deal_net_cash(deal: dict) -> Decimal:
+    """Actual realized cash from an Exness deal, including its signed commission."""
+    value = Decimal("0")
+    profit = deal.get("profit")
+    if isinstance(profit, dict) and profit.get("amount") not in (None, ""):
+        value += dec(profit["amount"])
+    elif profit not in (None, "") and not isinstance(profit, dict):
+        value += dec(profit)
+    commission = deal.get("commission")
+    if commission not in (None, ""):
+        value += dec(commission)
+    return value
+
+
+def _classify_report_orders(
+    order_items: list[dict],
+    deal_items: list[dict],
+    start_utc: datetime,
+    end_utc: datetime,
+    instrument: str,
+    snapshot: dict | None = None,
+) -> dict:
+    """Classify today's Entry 1 orders using Exness current state and history.
+
+    History contains filled/cancelled/rejected orders only. Pending orders and
+    open positions must come from the current snapshot. A filled order is not
+    considered active merely because an opening deal exists: its position must
+    still be present in the live snapshot.
+    """
+    snapshot = snapshot or {}
+    orders = _history_orders({"items": order_items})
+    deals = _history_deals({"items": deal_items})
+    live_orders = snapshot.get("orders", []) or []
+    live_positions = snapshot.get("positions", []) or []
+
+    def is_xau(row: dict) -> bool:
+        return str(row.get("instrument", "")).upper() == instrument.upper()
+
+    live_entry_orders = [
+        row for row in live_orders
+        if is_xau(row)
+        and str(row.get("order_type", "")).lower() == "limit"
+        and str(row.get("state", "")).lower() in {"placed", "pending_new", "pending", "accepted"}
+    ]
+    open_positions = [
+        row for row in live_positions
+        if is_xau(row)
+        and str(row.get("state", "")).lower() in {"open", "opened"}
+    ]
+    live_position_ids = {
+        str(row.get("position_id") or "")
+        for row in open_positions
+        if row.get("position_id") not in (None, "")
+    }
+    open_deals = [
+        deal for deal in deals
+        if str(deal.get("type", "")).lower() == "open" and is_xau(deal)
+    ]
+    open_position_by_order = {
+        str(deal.get("order_id") or ""): str(deal.get("position_id") or "")
+        for deal in open_deals
+        if deal.get("order_id") and deal.get("position_id")
+    }
+
+    report = {
+        "total": 0,
+        "active_count": 0,
+        "inactive_count": 0,
+        "active_pnl": Decimal("0"),
+        "inactive_pnl": Decimal("0"),
+        "profit_day": Decimal("0"),
+    }
+
+    seen_order_ids: set[str] = set()
+    counted_live_position_ids: set[str] = set()
+
+    # Pending orders are live activity and are not returned by order history.
+    for order in live_entry_orders:
+        order_id = str(order.get("order_id") or "")
+        if order_id and order_id in seen_order_ids:
             continue
-        reason = str(order.get('reason', '')).lower()
-        if reason not in {'sl', 'tp'}: continue
-        estimate = _report_cash_for_order(order, reason.upper())
-        if estimate is None: continue
-        report['total'] += 1
-        report['inactive_count'] += 1
-        report['inactive_pnl'] += estimate
-    report['profit_day'] = report['active_pnl']
+        if order_id:
+            seen_order_ids.add(order_id)
+        report["active_count"] += 1
+
+    # Historical endpoint returns filled, cancelled and rejected orders.
+    for order in orders:
+        if str(order.get("order_type", "")).lower() != "limit" or not is_xau(order):
+            continue
+        created = _history_time(order.get("create_time"))
+        if not created or not (start_utc <= created < end_utc):
+            continue
+        order_id = str(order.get("order_id") or "")
+        if not order_id or order_id in seen_order_ids:
+            continue
+        seen_order_ids.add(order_id)
+
+        state = str(order.get("state", "")).lower()
+        position_id = str(order.get("position_id") or open_position_by_order.get(order_id) or "")
+
+        if state == "filled" and position_id and position_id in live_position_ids:
+            report["active_count"] += 1
+            counted_live_position_ids.add(position_id)
+        elif state in {"filled", "cancelled", "rejected"}:
+            # Filled but no longer in the live snapshot means the trade closed.
+            # Cancelled/rejected entry orders are inactive, but have no trade P/L.
+            report["inactive_count"] += 1
+
+    # Count live positions even if their entry order was created before today
+    # or is absent from today's historical-order range.
+    for position in open_positions:
+        position_id = str(position.get("position_id") or "")
+        if position_id and position_id in counted_live_position_ids:
+            continue
+        report["active_count"] += 1
+
+    report["total"] = report["active_count"] + report["inactive_count"]
+
+    # Floating P/L must come only from positions currently open in the snapshot.
+    for position in open_positions:
+        raw_profit = position.get("profit")
+        if isinstance(raw_profit, dict):
+            raw_profit = raw_profit.get("amount")
+        if raw_profit not in (None, ""):
+            try:
+                report["active_pnl"] += dec(raw_profit)
+            except (InvalidOperation, TypeError, ValueError):
+                logging.warning("Skipping an invalid floating P/L value in the Exness snapshot.")
+
+    # Realized P/L comes from actual closing deals, never from estimated SL/TP.
+    # Include every XAUUSD close deal recorded today, including partial closes.
+    realized_today = Decimal("0")
+    closed_position_ids: set[str] = set()
+    for deal in deals:
+        if str(deal.get("type", "")).lower() != "close" or not is_xau(deal):
+            continue
+        try:
+            cash = _report_deal_net_cash(deal)
+        except (InvalidOperation, TypeError, ValueError):
+            logging.warning("Skipping an invalid realized P/L value in Exness deal history.")
+            continue
+        realized_today += cash
+        position_id = str(deal.get("position_id") or "")
+        if position_id and position_id not in live_position_ids:
+            report["inactive_pnl"] += cash
+            closed_position_ids.add(position_id)
+
+    # Daily profit includes today's realized closes plus current floating P/L.
+    report["profit_day"] = realized_today + report["active_pnl"]
     return report
+
 
 def _update_daily_report_file(report: dict, report_date) -> None:
     DAILY_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1908,15 +2024,14 @@ def update_hourly_daily_report(api: ExnessAPI, snapshot: dict, instrument: str) 
     start_utc, end_utc = midnight_ist.astimezone(UTC), datetime.now(UTC)
     orders = api.orders_history_all_since(start_utc, end_utc, instrument)
     deals = api.deals_history_all_since(start_utc, end_utc)
-    report = _classify_report_orders(orders, deals, start_utc, end_utc, instrument)
-    for position in (snapshot.get('positions', []) or []):
-        if str(position.get('instrument', '')).upper() != instrument.upper() or str(position.get('state', '')).lower() not in {'open', 'opened'}: continue
-        raw = position.get('profit')
-        if isinstance(raw, dict): raw = raw.get('amount')
-        if raw not in (None, ''): report['active_pnl'] += dec(raw)
-    report['profit_day'] = report['active_pnl']
+    report = _classify_report_orders(orders, deals, start_utc, end_utc, instrument, snapshot)
     _update_daily_report_file(report, now_ist.date())
-    logging.info('Hourly daily report refreshed: %s | trades %d | active %d | inactive %d | active P/L %s | inactive P/L %s', DAILY_REPORT_PATH, report['total'], report['active_count'], report['inactive_count'], _report_money(report['active_pnl']), _report_money(report['inactive_pnl']))
+    logging.info(
+        "Hourly daily report refreshed: %s | trades %d | active %d | inactive %d | active P/L %s | inactive P/L %s | day P/L %s",
+        DAILY_REPORT_PATH, report["total"], report["active_count"], report["inactive_count"],
+        _report_money(report["active_pnl"]), _report_money(report["inactive_pnl"]),
+        _report_money(report["profit_day"]),
+    )
 
 def _display_price(value: Any, digits: int = 3) -> str:
     if value in (None, ""):
