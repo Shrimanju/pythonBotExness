@@ -2166,6 +2166,9 @@ def main() -> int:
         })
         logging.warning("An existing XAUUSD order or position was found. The bot will manage/wait for it and will not place another entry.")
     last_bar = store.get("last_processed_m1", "")
+    last_report_hour = ""
+    update_hourly_daily_report(api, snap, cfg.instrument)
+    last_report_hour = datetime.now(IST).strftime("%Y-%m-%d-%H")
 
     while True:
         try:
@@ -2181,6 +2184,10 @@ def main() -> int:
                 continue
 
             snap = api.snapshot()
+            current_report_hour = datetime.now(IST).strftime("%Y-%m-%d-%H")
+            if current_report_hour != last_report_hour:
+                update_hourly_daily_report(api, snap, cfg.instrument)
+                last_report_hour = current_report_hour
             active_orders, open_positions = instrument_activity(snap, cfg.instrument)
             trade_locked = refresh_trade_lock(store, api, snap, cfg.instrument)
             unresolved = pending_submission_blocks(store, snap, cfg.instrument)
