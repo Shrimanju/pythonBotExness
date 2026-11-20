@@ -421,6 +421,53 @@ class ExnessAPI:
         frame = frame[frame["time"] + duration <= now].reset_index(drop=True)
         return frame
 
+
+    def report_candles_between(self, start: datetime, end: datetime) -> pd.DataFrame:
+        """Fetch completed M1 candles in bounded chunks for today's pending-order audit."""
+        frames: list[pd.DataFrame] = []
+        cursor = start.astimezone(UTC).replace(second=0, microsecond=0)
+        end = end.astimezone(UTC)
+        while cursor < end:
+            chunk_end = min(end, cursor + timedelta(minutes=500))
+            params = {
+                "instrument": self.cfg.instrument,
+                "timeframe": "M1",
+                "price_type": "both",
+                "from": utc_iso(cursor),
+                "to": utc_iso(chunk_end),
+            }
+            path = f"/v1/market-data/accounts/{self.cfg.account_id}/candles?{urlencode(params)}"
+            data = self.get(path)
+            rows = data.get("candles", []) or []
+            normalized = []
+            for row in rows:
+                item = dict(row)
+                bid = row.get("bid") if isinstance(row.get("bid"), dict) else None
+                ask = row.get("ask") if isinstance(row.get("ask"), dict) else None
+                if bid:
+                    for col in ("open", "high", "low", "close"):
+                        item[col] = bid.get(col)
+                if ask:
+                    for col in ("open", "high", "low", "close"):
+                        item[f"ask_{col}"] = ask.get(col)
+                normalized.append(item)
+            if normalized:
+                frame = pd.DataFrame(normalized)
+                frame["time"] = pd.to_datetime(frame["time"], utc=True)
+                for col in ["open", "high", "low", "close", "ask_open", "ask_high", "ask_low", "ask_close"]:
+                    if col in frame.columns:
+                        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+                frame = frame.dropna(subset=["time", "open", "high", "low", "close"])
+                frames.append(frame)
+            cursor = chunk_end
+        if not frames:
+            return pd.DataFrame(columns=["time", "open", "high", "low", "close"])
+        result = pd.concat(frames, ignore_index=True)
+        result = result.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        now = pd.Timestamp.now(tz="UTC")
+        result = result[result["time"] + pd.Timedelta(minutes=1) <= now].reset_index(drop=True)
+        return result
+
     def place_entry_limit(self, signal: dict, volume_text: str, idem: str) -> dict:
         body = {
             "instrument": self.cfg.instrument,
@@ -1815,18 +1862,64 @@ DAILY_REPORT_PATH = Path(os.getenv('DAILY_REPORT_FILE', 'KS_Trader_Desk_Daily_Re
 def _report_money(value: Decimal) -> str:
     return f'${value:,.2f}'
 
-def _report_deal_net_cash(deal: dict) -> Decimal:
-    """Actual realized cash from an Exness deal, including its signed commission."""
-    value = Decimal("0")
-    profit = deal.get("profit")
-    if isinstance(profit, dict) and profit.get("amount") not in (None, ""):
-        value += dec(profit["amount"])
-    elif profit not in (None, "") and not isinstance(profit, dict):
-        value += dec(profit)
-    commission = deal.get("commission")
-    if commission not in (None, ""):
-        value += dec(commission)
-    return value
+def _report_order_money(order: dict, cfg: Config, outcome: str) -> Decimal:
+    """Return planned cash outcome from the order's original entry/SL/TP and volume."""
+    entry = order.get("price")
+    level = order.get("stop_loss_price") if outcome == "sl" else order.get("take_profit_price")
+    volume = order.get("volume")
+    if any(value in (None, "") for value in (entry, level, volume)):
+        return Decimal("0")
+    distance = abs(dec(level) - dec(entry))
+    cash = distance * dec(volume) * dec(cfg.contract_size)
+    return -cash if outcome == "sl" else cash
+
+
+def _pending_order_pre_entry_outcome(order: dict, candles: pd.DataFrame, cfg: Config) -> str | None:
+    """Return 'sl'/'tp' only when that level was touched before the pending entry."""
+    created = _history_time(order.get("create_time"))
+    if created is None or candles.empty:
+        return None
+    # Ignore the candle that was already in progress when the order was placed.
+    created_minute = created.replace(second=0, microsecond=0)
+    scan = candles[candles["time"] > pd.Timestamp(created_minute)].copy()
+    if scan.empty:
+        return None
+
+    side = str(order.get("direction") or order.get("side") or "").lower()
+    if side not in {"buy", "sell"}:
+        return None
+    try:
+        entry = dec(order.get("price"))
+        sl = dec(order.get("stop_loss_price"))
+        tp = dec(order.get("take_profit_price"))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+    for _, candle in scan.iterrows():
+        # Entry trigger uses the executable side: ask for BUY, bid for SELL.
+        if side == "buy":
+            entry_low = candle.get("ask_low", candle.get("low"))
+            entry_hit = entry_low is not None and not pd.isna(entry_low) and dec(entry_low) <= entry
+            sl_hit = dec(candle["low"]) <= sl
+            tp_high = candle.get("high")
+            tp_hit = tp_high is not None and not pd.isna(tp_high) and dec(tp_high) >= tp
+        else:
+            entry_high = candle.get("high")
+            entry_hit = entry_high is not None and not pd.isna(entry_high) and dec(entry_high) >= entry
+            sl_high = candle.get("ask_high", candle.get("high"))
+            sl_hit = sl_high is not None and not pd.isna(sl_high) and dec(sl_high) >= sl
+            tp_low = candle.get("ask_low", candle.get("low"))
+            tp_hit = tp_low is not None and not pd.isna(tp_low) and dec(tp_low) <= tp
+
+        # User-approved conservative tie-break: entry wins if both entry and
+        # SL/TP are touched within the same M1 candle.
+        if entry_hit:
+            return None
+        if sl_hit:
+            return "sl"
+        if tp_hit:
+            return "tp"
+    return None
 
 
 def _classify_report_orders(
@@ -1836,104 +1929,49 @@ def _classify_report_orders(
     end_utc: datetime,
     instrument: str,
     snapshot: dict | None = None,
+    cfg: Config | None = None,
+    candles: pd.DataFrame | None = None,
 ) -> dict:
-    """Classify today's Entry 1 orders using Exness current state and history.
-
-    History contains filled/cancelled/rejected orders only. Pending orders and
-    open positions must come from the current snapshot. A filled order is not
-    considered active merely because an opening deal exists: its position must
-    still be present in the live snapshot.
-    """
+    """Classify today's Entry 1 LIMIT orders by actual entry-first price sequence."""
     snapshot = snapshot or {}
+    if cfg is None:
+        raise ValueError("Config is required to calculate planned inactive-order P/L.")
     orders = _history_orders({"items": order_items})
-    deals = _history_deals({"items": deal_items})
     live_orders = snapshot.get("orders", []) or []
     live_positions = snapshot.get("positions", []) or []
 
     def is_xau(row: dict) -> bool:
         return str(row.get("instrument", "")).upper() == instrument.upper()
 
-    live_entry_orders = [
-        row for row in live_orders
-        if is_xau(row)
-        and str(row.get("order_type", "")).lower() == "limit"
-        and str(row.get("state", "")).lower() in {"placed", "pending_new", "pending", "accepted"}
-    ]
-    open_positions = [
-        row for row in live_positions
-        if is_xau(row)
-        and str(row.get("state", "")).lower() in {"open", "opened"}
-    ]
-    live_position_ids = {
-        str(row.get("position_id") or "")
-        for row in open_positions
-        if row.get("position_id") not in (None, "")
-    }
-    open_deals = [
-        deal for deal in deals
-        if str(deal.get("type", "")).lower() == "open" and is_xau(deal)
-    ]
-    open_position_by_order = {
-        str(deal.get("order_id") or ""): str(deal.get("position_id") or "")
-        for deal in open_deals
-        if deal.get("order_id") and deal.get("position_id")
-    }
-
     report = {
         "total": 0,
         "active_count": 0,
         "inactive_count": 0,
+        "waiting_count": 0,
         "active_pnl": Decimal("0"),
         "inactive_pnl": Decimal("0"),
         "profit_day": Decimal("0"),
     }
 
-    seen_order_ids: set[str] = set()
-    counted_live_position_ids: set[str] = set()
-
-    # Pending orders are live activity and are not returned by order history.
-    for order in live_entry_orders:
-        order_id = str(order.get("order_id") or "")
-        if order_id and order_id in seen_order_ids:
+    # All unique Entry 1 LIMIT orders created today, including currently pending
+    # orders and completed/cancelled orders returned by history.
+    unique_orders: dict[str, dict] = {}
+    for row in orders + live_orders:
+        if not is_xau(row) or str(row.get("order_type", "")).lower() != "limit":
             continue
-        if order_id:
-            seen_order_ids.add(order_id)
-        report["active_count"] += 1
-
-    # Historical endpoint returns filled, cancelled and rejected orders.
-    for order in orders:
-        if str(order.get("order_type", "")).lower() != "limit" or not is_xau(order):
+        created = _history_time(row.get("create_time"))
+        if created is None or not (start_utc <= created < end_utc):
             continue
-        created = _history_time(order.get("create_time"))
-        if not created or not (start_utc <= created < end_utc):
+        order_id = str(row.get("order_id") or "")
+        if not order_id:
             continue
-        order_id = str(order.get("order_id") or "")
-        if not order_id or order_id in seen_order_ids:
-            continue
-        seen_order_ids.add(order_id)
+        unique_orders[order_id] = row
 
-        state = str(order.get("state", "")).lower()
-        position_id = str(order.get("position_id") or open_position_by_order.get(order_id) or "")
-
-        if state == "filled" and position_id and position_id in live_position_ids:
-            report["active_count"] += 1
-            counted_live_position_ids.add(position_id)
-        elif state in {"filled", "cancelled", "rejected"}:
-            # Filled but no longer in the live snapshot means the trade closed.
-            # Cancelled/rejected entry orders are inactive, but have no trade P/L.
-            report["inactive_count"] += 1
-
-    # Count live positions even if their entry order was created before today
-    # or is absent from today's historical-order range.
-    for position in open_positions:
-        position_id = str(position.get("position_id") or "")
-        if position_id and position_id in counted_live_position_ids:
-            continue
-        report["active_count"] += 1
-
-    report["total"] = report["active_count"] + report["inactive_count"]
-
-    # Floating P/L must come only from positions currently open in the snapshot.
+    open_positions = [
+        row for row in live_positions
+        if is_xau(row) and str(row.get("state", "")).lower() in {"open", "opened"}
+    ]
+    report["active_count"] = len(open_positions)
     for position in open_positions:
         raw_profit = position.get("profit")
         if isinstance(raw_profit, dict):
@@ -1944,31 +1982,28 @@ def _classify_report_orders(
             except (InvalidOperation, TypeError, ValueError):
                 logging.warning("Skipping an invalid floating P/L value in the Exness snapshot.")
 
-    # Actual deal cash includes realized profit/loss and signed commission.
-    # Include today's opening commissions as well as closing deals.
-    realized_today = Decimal("0")
-    cash_by_position: dict[str, Decimal] = {}
-    for deal in deals:
-        deal_type = str(deal.get("type", "")).lower()
-        if deal_type not in {"open", "close"} or not is_xau(deal):
+    for order in unique_orders.values():
+        state = str(order.get("state", "")).lower()
+        # Filled orders are not pending-before-entry outcomes. Their open
+        # position, if any, is counted above; closed filled trades are excluded.
+        if state in {"filled", "executed", "closed"}:
             continue
-        try:
-            cash = _report_deal_net_cash(deal)
-        except (InvalidOperation, TypeError, ValueError):
-            logging.warning("Skipping an invalid P/L value in Exness deal history.")
-            continue
-        realized_today += cash
-        position_id = str(deal.get("position_id") or "")
-        if position_id:
-            cash_by_position[position_id] = cash_by_position.get(position_id, Decimal("0")) + cash
+        outcome = _pending_order_pre_entry_outcome(order, candles if candles is not None else pd.DataFrame(), cfg)
+        if outcome == "sl":
+            report["inactive_count"] += 1
+            report["inactive_pnl"] += _report_order_money(order, cfg, "sl")
+        elif outcome == "tp":
+            report["inactive_count"] += 1
+            report["inactive_pnl"] += _report_order_money(order, cfg, "tp")
+        else:
+            # Untouched pending orders, cancelled orders with no pre-entry
+            # SL/TP touch, and rejected orders remain waiting/unclassified.
+            report["waiting_count"] += 1
 
-    # Inactive P/L is the actual net deal cash for positions no longer open.
-    for position_id, cash in cash_by_position.items():
-        if position_id not in live_position_ids:
-            report["inactive_pnl"] += cash
-
-    # Daily profit = today's realized deal cash + current floating P/L.
-    report["profit_day"] = realized_today + report["active_pnl"]
+    report["total"] = report["active_count"] + report["inactive_count"] + report["waiting_count"]
+    # Daily profit is deliberately active floating P/L only. Inactive P/L is
+    # hypothetical and is reported separately; closed-trade deals are excluded.
+    report["profit_day"] = report["active_pnl"]
     return report
 
 
@@ -2016,14 +2051,16 @@ def update_hourly_daily_report(api: ExnessAPI, snapshot: dict, instrument: str) 
     midnight_ist = datetime.combine(now_ist.date(), datetime.min.time(), tzinfo=IST)
     start_utc, end_utc = midnight_ist.astimezone(UTC), datetime.now(UTC)
     orders = api.orders_history_all_since(start_utc, end_utc, instrument)
-    deals = api.deals_history_all_since(start_utc, end_utc)
-    report = _classify_report_orders(orders, deals, start_utc, end_utc, instrument, snapshot)
+    candles = api.report_candles_between(start_utc, end_utc)
+    report = _classify_report_orders(
+        orders, [], start_utc, end_utc, instrument, snapshot, api.cfg, candles
+    )
     _update_daily_report_file(report, now_ist.date())
     logging.info(
-        "Hourly daily report refreshed: %s | trades %d | active %d | inactive %d | active P/L %s | inactive P/L %s | day P/L %s",
+        "Hourly daily report refreshed: %s | trades %d | active %d | inactive %d | waiting %d | active P/L %s | inactive P/L %s | day P/L %s",
         DAILY_REPORT_PATH, report["total"], report["active_count"], report["inactive_count"],
-        _report_money(report["active_pnl"]), _report_money(report["inactive_pnl"]),
-        _report_money(report["profit_day"]),
+        report["waiting_count"], _report_money(report["active_pnl"]),
+        _report_money(report["inactive_pnl"]), _report_money(report["profit_day"]),
     )
 
 def _display_price(value: Any, digits: int = 3) -> str:
