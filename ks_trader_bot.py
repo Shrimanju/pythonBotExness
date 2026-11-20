@@ -1882,6 +1882,15 @@ def _pending_order_pre_entry_outcome(order: dict, candles: pd.DataFrame, cfg: Co
     # Ignore the candle that was already in progress when the order was placed.
     created_minute = created.replace(second=0, microsecond=0)
     scan = candles[candles["time"] > pd.Timestamp(created_minute)].copy()
+    # Stop at the broker's cancellation/update time so later market movement
+    # cannot be attributed to an order that was no longer pending.
+    closed_at = (
+        _history_time(order.get("close_time"))
+        or _history_time(order.get("update_time"))
+        or _history_time(order.get("last_update_time"))
+    )
+    if closed_at is not None:
+        scan = scan[scan["time"] <= pd.Timestamp(closed_at.replace(second=0, microsecond=0))]
     if scan.empty:
         return None
 
@@ -1984,9 +1993,9 @@ def _classify_report_orders(
 
     for order in unique_orders.values():
         state = str(order.get("state", "")).lower()
-        # Filled orders are not pending-before-entry outcomes. Their open
-        # position, if any, is counted above; closed filled trades are excluded.
-        if state in {"filled", "executed", "closed"}:
+        # Rejected submissions never became broker orders. Filled orders have
+        # crossed entry and must never be classified as pre-entry inactive.
+        if state in {"filled", "executed", "closed", "rejected", "failed"}:
             continue
         outcome = _pending_order_pre_entry_outcome(order, candles if candles is not None else pd.DataFrame(), cfg)
         if outcome == "sl":
