@@ -1815,18 +1815,6 @@ DAILY_REPORT_PATH = Path(os.getenv('DAILY_REPORT_FILE', 'KS_Trader_Desk_Daily_Re
 def _report_money(value: Decimal) -> str:
     return f'${value:,.2f}'
 
-def _report_cash_for_order(order: dict, reason: str) -> Decimal | None:
-    entry, sl, tp, volume = (order.get(k) for k in ('price', 'stop_loss_price', 'take_profit_price', 'volume'))
-    if any(v in (None, '') for v in (entry, sl, tp, volume)): return None
-    try:
-        entry_d, sl_d, tp_d, volume_d = map(dec, (entry, sl, tp, volume))
-        contract_size = dec(os.getenv('CONTRACT_SIZE', '100.0'))
-    except (InvalidOperation, TypeError, ValueError): return None
-    if volume_d <= 0 or str(order.get('direction', '')).lower() not in {'buy', 'sell'}: return None
-    if reason == 'SL': return -(abs(entry_d - sl_d) * contract_size * volume_d)
-    if reason == 'TP': return abs(tp_d - entry_d) * contract_size * volume_d
-    return None
-
 def _report_deal_net_cash(deal: dict) -> Decimal:
     """Actual realized cash from an Exness deal, including its signed commission."""
     value = Decimal("0")
@@ -1956,25 +1944,30 @@ def _classify_report_orders(
             except (InvalidOperation, TypeError, ValueError):
                 logging.warning("Skipping an invalid floating P/L value in the Exness snapshot.")
 
-    # Realized P/L comes from actual closing deals, never from estimated SL/TP.
-    # Include every XAUUSD close deal recorded today, including partial closes.
+    # Actual deal cash includes realized profit/loss and signed commission.
+    # Include today's opening commissions as well as closing deals.
     realized_today = Decimal("0")
-    closed_position_ids: set[str] = set()
+    cash_by_position: dict[str, Decimal] = {}
     for deal in deals:
-        if str(deal.get("type", "")).lower() != "close" or not is_xau(deal):
+        deal_type = str(deal.get("type", "")).lower()
+        if deal_type not in {"open", "close"} or not is_xau(deal):
             continue
         try:
             cash = _report_deal_net_cash(deal)
         except (InvalidOperation, TypeError, ValueError):
-            logging.warning("Skipping an invalid realized P/L value in Exness deal history.")
+            logging.warning("Skipping an invalid P/L value in Exness deal history.")
             continue
         realized_today += cash
         position_id = str(deal.get("position_id") or "")
-        if position_id and position_id not in live_position_ids:
-            report["inactive_pnl"] += cash
-            closed_position_ids.add(position_id)
+        if position_id:
+            cash_by_position[position_id] = cash_by_position.get(position_id, Decimal("0")) + cash
 
-    # Daily profit includes today's realized closes plus current floating P/L.
+    # Inactive P/L is the actual net deal cash for positions no longer open.
+    for position_id, cash in cash_by_position.items():
+        if position_id not in live_position_ids:
+            report["inactive_pnl"] += cash
+
+    # Daily profit = today's realized deal cash + current floating P/L.
     report["profit_day"] = realized_today + report["active_pnl"]
     return report
 
