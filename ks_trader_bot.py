@@ -1830,10 +1830,10 @@ def _report_cash_for_order(order: dict, reason: str) -> Decimal | None:
 def _classify_report_orders(order_items: list[dict], deal_items: list[dict], start_utc: datetime, end_utc: datetime, instrument: str) -> dict:
     orders = _history_orders({'items': order_items})
     deals = _history_deals({'items': deal_items})
-    opening_deals = [d for d in deals if str(d.get('type', '')).lower() == 'open']
-    opened_order_ids = {str(d.get('order_id') or '') for d in opening_deals}
-    opened_position_ids = {str(d.get('position_id') or '') for d in opening_deals}
-    result = {'total': 0, 'active_count': 0, 'inactive_count': 0, 'active_pnl': Decimal('0'), 'inactive_pnl': Decimal('0'), 'profit_day': Decimal('0')}
+    opened = [d for d in deals if str(d.get('type', '')).lower() == 'open']
+    opened_order_ids = {str(d.get('order_id') or '') for d in opened}
+    opened_position_ids = {str(d.get('position_id') or '') for d in opened}
+    report = {'total': 0, 'active_count': 0, 'inactive_count': 0, 'active_pnl': Decimal('0'), 'inactive_pnl': Decimal('0'), 'profit_day': Decimal('0')}
     seen = set()
     for order in orders:
         if str(order.get('order_type', '')).lower() != 'limit' or str(order.get('instrument', '')).upper() != instrument.upper(): continue
@@ -1844,47 +1844,46 @@ def _classify_report_orders(order_items: list[dict], deal_items: list[dict], sta
         seen.add(oid)
         pid = str(order.get('position_id') or '')
         if oid in opened_order_ids or (pid and pid in opened_position_ids):
-            result['total'] += 1
-            result['active_count'] += 1
-            for deal in deals:
-                if pid and str(deal.get('position_id') or '') == pid and str(deal.get('type', '')).lower() == 'close':
-                    profit = deal.get('profit')
-                    if isinstance(profit, dict) and profit.get('amount') not in (None, ''):
-                        result['active_pnl'] += dec(profit['amount'])
+            report['total'] += 1
+            report['active_count'] += 1
+            if pid:
+                for deal in deals:
+                    if str(deal.get('position_id') or '') == pid and str(deal.get('type', '')).lower() == 'close':
+                        profit = deal.get('profit')
+                        if isinstance(profit, dict) and profit.get('amount') not in (None, ''):
+                            report['active_pnl'] += dec(profit['amount'])
             continue
-        state = str(order.get('state', '')).lower()
         reason = str(order.get('reason', '')).lower()
-        if reason not in {'sl', 'tp'}:
-            if state in {'sl', 'stop_loss', 'stopped_by_sl'}: reason = 'sl'
-            elif state in {'tp', 'take_profit', 'closed_by_tp'}: reason = 'tp'
-            else: continue
+        if reason not in {'sl', 'tp'}: continue
         estimate = _report_cash_for_order(order, reason.upper())
         if estimate is None: continue
-        result['total'] += 1
-        result['inactive_count'] += 1
-        result['inactive_pnl'] += estimate
-    result['profit_day'] = result['active_pnl']
-    return result
+        report['total'] += 1
+        report['inactive_count'] += 1
+        report['inactive_pnl'] += estimate
+    report['profit_day'] = report['active_pnl']
+    return report
 
 def _update_daily_report_file(report: dict, report_date) -> None:
     DAILY_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    label, sep = report_date.strftime('%d-%b-%Y'), '=' * 31
-    block = '\n'.join([sep, f'Date : {label}',
+    label, separator = report_date.strftime('%d-%b-%Y'), '=' * 31
+    block = '\n'.join([separator, f'Date : {label}',
         f'Number of trades taken per day : {report["total"]}',
         f'Overall active orders : {report["active_count"]}',
         f'Overall inactive orders : {report["inactive_count"]}',
         f'Profit of the day : {_report_money(report["profit_day"])}',
         f'P/L of active orders : {_report_money(report["active_pnl"])}',
-        f'P/L of inactive orders : {_report_money(report["inactive_pnl"])}', sep])
+        f'P/L of inactive orders : {_report_money(report["inactive_pnl"])}', separator])
     old = DAILY_REPORT_PATH.read_text(encoding='utf-8') if DAILY_REPORT_PATH.exists() else ''
-    sections = re.split(r'(?m)^={10,}\s*$', old)
-    out, replaced = [], False
-    for section in sections:
+    pattern = re.compile(r'(?ms)^={10,}[^\\n]*\\n.*?^={10,}\\s*$')
+    chunks = list(pattern.finditer(old))
+    rebuilt, inserted = [], False
+    for match in chunks:
+        section = match.group(0)
         if f'Date : {label}' in section:
-            if not replaced: out.append(block); replaced = True
-        elif section.strip(): out.append(sep + '\n' + section.strip() + '\n' + sep)
-    if not replaced: out.append(block)
-    DAILY_REPORT_PATH.write_text('\n'.join(out).rstrip() + '\n', encoding='utf-8')
+            if not inserted: rebuilt.append(block); inserted = True
+        else: rebuilt.append(section.strip())
+    if not inserted: rebuilt.append(block)
+    DAILY_REPORT_PATH.write_text('\n'.join(rebuilt).rstrip() + '\n', encoding='utf-8')
 
 def update_hourly_daily_report(api: ExnessAPI, snapshot: dict, instrument: str) -> None:
     now_ist = datetime.now(IST)
@@ -1900,7 +1899,7 @@ def update_hourly_daily_report(api: ExnessAPI, snapshot: dict, instrument: str) 
         if raw not in (None, ''): report['active_pnl'] += dec(raw)
     report['profit_day'] = report['active_pnl']
     _update_daily_report_file(report, now_ist.date())
-    logging.info('Hourly report refreshed: %s | total %d | active %d | inactive %d | active P/L %s | inactive P/L %s', DAILY_REPORT_PATH, report['total'], report['active_count'], report['inactive_count'], _report_money(report['active_pnl']), _report_money(report['inactive_pnl']))
+    logging.info('Hourly daily report refreshed: %s | trades %d | active %d | inactive %d | active P/L %s | inactive P/L %s', DAILY_REPORT_PATH, report['total'], report['active_count'], report['inactive_count'], _report_money(report['active_pnl']), _report_money(report['inactive_pnl']))
 
 def _display_price(value: Any, digits: int = 3) -> str:
     if value in (None, ""):
