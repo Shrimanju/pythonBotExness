@@ -2017,6 +2017,7 @@ def _update_daily_report_file(report: dict, report_date) -> None:
         f'Number of trades taken per day : {report["total"]}',
         f'Overall active orders : {report["active_count"]}',
         f'Overall inactive orders : {report["inactive_count"]}',
+        f'Pending / waiting orders : {report.get("waiting_count", 0)}',
         f'Profit of the day : {_report_money(report["profit_day"])}',
         f'P/L of active orders : {_report_money(report["active_pnl"])}',
         f'P/L of inactive orders : {_report_money(report["inactive_pnl"])}',
