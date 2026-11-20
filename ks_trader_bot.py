@@ -1865,25 +1865,42 @@ def _classify_report_orders(order_items: list[dict], deal_items: list[dict], sta
 
 def _update_daily_report_file(report: dict, report_date) -> None:
     DAILY_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    label, separator = report_date.strftime('%d-%b-%Y'), '=' * 31
-    block = '\n'.join([separator, f'Date : {label}',
+    label = report_date.strftime('%d-%b-%Y')
+    separator = '=' * 31
+    block = '\n'.join([
+        separator,
+        f'Date : {label}',
         f'Number of trades taken per day : {report["total"]}',
         f'Overall active orders : {report["active_count"]}',
         f'Overall inactive orders : {report["inactive_count"]}',
         f'Profit of the day : {_report_money(report["profit_day"])}',
         f'P/L of active orders : {_report_money(report["active_pnl"])}',
-        f'P/L of inactive orders : {_report_money(report["inactive_pnl"])}', separator])
-    old = DAILY_REPORT_PATH.read_text(encoding='utf-8') if DAILY_REPORT_PATH.exists() else ''
-    pattern = re.compile(r'(?ms)^={10,}[^\n]*\n.*?^={10,}\s*)
-    chunks = list(pattern.finditer(old))
-    rebuilt, inserted = [], False
-    for match in chunks:
-        section = match.group(0)
-        if f'Date : {label}' in section:
-            if not inserted: rebuilt.append(block); inserted = True
-        else: rebuilt.append(section.strip())
-    if not inserted: rebuilt.append(block)
-    DAILY_REPORT_PATH.write_text('\n'.join(rebuilt).rstrip() + '\n', encoding='utf-8')
+        f'P/L of inactive orders : {_report_money(report["inactive_pnl"])}',
+        separator,
+    ])
+    old_lines = DAILY_REPORT_PATH.read_text(encoding='utf-8').splitlines() if DAILY_REPORT_PATH.exists() else []
+    blocks = []
+    current = []
+    for line in old_lines:
+        if line.startswith('=') and len(line) >= 10:
+            if current: blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+        elif line.strip():
+            current = [line]
+    if current: blocks.append(current)
+    new_blocks = []
+    replaced = False
+    for lines in blocks:
+        if any(line.strip() == f'Date : {label}' for line in lines):
+            if not replaced:
+                new_blocks.append(block)
+                replaced = True
+        else:
+            new_blocks.append('\n'.join(lines).strip())
+    if not replaced: new_blocks.append(block)
+    DAILY_REPORT_PATH.write_text('\n'.join(new_blocks).rstrip() + '\n', encoding='utf-8')
 
 def update_hourly_daily_report(api: ExnessAPI, snapshot: dict, instrument: str) -> None:
     now_ist = datetime.now(IST)
