@@ -1882,13 +1882,16 @@ def _pending_order_pre_entry_outcome(order: dict, candles: pd.DataFrame, cfg: Co
     # Ignore the candle that was already in progress when the order was placed.
     created_minute = created.replace(second=0, microsecond=0)
     scan = candles[candles["time"] > pd.Timestamp(created_minute)].copy()
-    # Stop at the broker's cancellation/update time so later market movement
-    # cannot be attributed to an order that was no longer pending.
-    closed_at = (
-        _history_time(order.get("close_time"))
-        or _history_time(order.get("update_time"))
-        or _history_time(order.get("last_update_time"))
-    )
+    # For cancelled/expired orders, stop at the cancellation time so later
+    # market movement cannot be attributed to an order that was no longer pending.
+    state = str(order.get("state", "")).lower()
+    closed_at = None
+    if state in {"cancelled", "canceled", "expired"}:
+        closed_at = (
+            _history_time(order.get("close_time"))
+            or _history_time(order.get("update_time"))
+            or _history_time(order.get("last_update_time"))
+        )
     if closed_at is not None:
         scan = scan[scan["time"] <= pd.Timestamp(closed_at.replace(second=0, microsecond=0))]
     if scan.empty:
